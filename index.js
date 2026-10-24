@@ -1,6 +1,7 @@
-// Lorebook Forge v1.2 — gera/atualiza entradas de World Info a partir do chat,
+// Lorebook Forge v1.3 — gera/atualiza entradas de World Info a partir do chat,
 // usando a conexão/modelo JÁ configurados no SillyTavern.
-// Nenhuma API key ou LLM embutido. Com índice anti-duplicata entre lorebooks.
+// Nenhuma API key ou LLM embutido. Com índice anti-duplicata entre lorebooks
+// e parser robusto (JSON cortado, aspas quebradas, texto extra).
 
 import * as WI from '../../../world-info.js';
 
@@ -29,7 +30,7 @@ const defaultSettings = Object.freeze({
     autoEnabled: false,
     autoEvery: 20,
     autoMode: 'single',
-    // v1.2 — anti-duplicata
+    // anti-duplicata
     indexScope: 'active',       // active | all | target
     indexChars: 16000,
     dupCheck: true,
@@ -179,9 +180,9 @@ function activeBookNames(targetBook) {
     const add = (n) => { if (n && names.includes(n)) set.add(n); };
 
     add(targetBook);
-    add(c.chatMetadata?.[metaKey()]);                                        // lorebook do chat
+    add(c.chatMetadata?.[metaKey()]);                                                    // lorebook do chat
     (Array.isArray(WI.selected_world_info) ? WI.selected_world_info : []).forEach(add); // globais
-    add(c.powerUserSettings?.persona_description_lorebook);                  // persona
+    add(c.powerUserSettings?.persona_description_lorebook);                              // persona
 
     const chars = [];
     if (c.groupId) {
@@ -195,9 +196,9 @@ function activeBookNames(targetBook) {
     }
     const charLore = Array.isArray(WI.world_info?.charLore) ? WI.world_info.charLore : [];
     for (const ch of chars) {
-        add(ch?.data?.extensions?.world);                                    // principal
+        add(ch?.data?.extensions?.world);                                // principal
         const extra = charLore.find(e => e.name === filenameOf(ch));
-        (extra?.extraBooks ?? []).forEach(add);                              // extras
+        (extra?.extraBooks ?? []).forEach(add);                          // extras
     }
     return [...set];
 }
@@ -318,7 +319,7 @@ function buildSystemPrompt() {
         '- Reply with ONE valid JSON object and NOTHING else: no markdown, no code fences, no explanations.',
         '- Keep any internal reasoning brief; the final answer must be the JSON object.',
         '- Shape: {"entries":[{"id":"","comment":"...","key":["...","...","..."],"content":"- ...\\n- ..."}]}',
-        '- Use double quotes. Escape line breaks inside strings as \\n. No trailing commas.',
+        '- Use double quotes. Inside strings, escape double quotes as \\" and line breaks as \\n. No trailing commas.',
         '',
         'FIELD RULES:',
         '- "id": the id of the existing entry you are updating (from section A), or "" for a new entry.',
@@ -462,6 +463,7 @@ function escapeNewlinesInStrings(src) {
 function tryParse(str) {
     const attempts = [str, str.replace(/[“”]/g, '"').replace(/,\s*([}\]])/g, '$1')];
     attempts.push(escapeNewlinesInStrings(attempts[1]));
+    attempts.push(escapeNewlinesInStrings(str));
     for (const a of attempts) {
         try { return JSON.parse(a); } catch { /* próxima */ }
     }
@@ -488,40 +490,135 @@ function normalizeEntry(e) {
     return { id, comment, key: keys, content };
 }
 
-function parseEntries(raw) {
-    let t = String(raw).replace(/<(think|thinking|reasoning)>[\s\S]*?<\/\1>/gi, '').trim();
-    const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fence) t = fence[1].trim();
-
-    const candidates = [];
-    const fo = t.indexOf('{'), lo = t.lastIndexOf('}');
-    const fa = t.indexOf('['), la = t.lastIndexOf(']');
-    if (fo !== -1 && lo > fo) candidates.push(t.slice(fo, lo + 1));
-    if (fa !== -1 && la > fa) candidates.push(t.slice(fa, la + 1));
-    if (fa !== -1 && fa < fo) candidates.reverse();
-
-    for (const cand of candidates) {
-        const obj = tryParse(cand);
-        if (obj === undefined) continue;
-        let arr = [];
-        if (Array.isArray(obj)) arr = obj;
-        else if (Array.isArray(obj.entries)) arr = obj.entries;
-        else if (obj.comment || obj.content) arr = [obj];
-        const items = arr.map(normalizeEntry).filter(Boolean);
-        if (items.length) return items;
+// Fim de um objeto/array balanceado (respeitando strings). -1 = cortado.
+function balancedEnd(t, start) {
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < t.length; i++) {
+        const ch = t[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{' || ch === '[') depth++;
+        else if (ch === '}' || ch === ']') { depth--; if (depth === 0) return i; }
     }
-    throw new Error('Resposta do modelo não é um JSON válido.');
+    return -1;
+}
+
+function itemsFrom(obj) {
+    let arr = [];
+    if (Array.isArray(obj)) arr = obj;
+    else if (obj && Array.isArray(obj.entries)) arr = obj.entries;
+    else if (obj && typeof obj === 'object' && (obj.comment || obj.content)) arr = [obj];
+    return arr.map(normalizeEntry).filter(Boolean);
+}
+
+// Procura JSON em qualquer lugar do texto. Se o JSON externo estiver cortado,
+// aproveita as entradas internas que vieram completas.
+function scanJson(t) {
+    const loose = [];
+    let truncated = false;
+    for (let i = 0; i < t.length; i++) {
+        const ch = t[i];
+        if (ch !== '{' && ch !== '[') continue;
+        const end = balancedEnd(t, i);
+        if (end === -1) { truncated = true; continue; }
+        const obj = tryParse(t.slice(i, end + 1));
+        if (obj === undefined) continue;
+        const items = itemsFrom(obj);
+        if (Array.isArray(obj) || Array.isArray(obj?.entries)) {
+            if (items.length) return { items, truncated: false };
+            continue;
+        }
+        if (items.length) { loose.push(...items); i = end; }
+    }
+    return { items: loose, truncated };
+}
+
+// Último recurso: extrai campo por campo (tolera aspas sem escape dentro do texto).
+function lenientEntries(t) {
+    const unesc = (v) => v.replace(/\\n/g, '\n').replace(/\\t/g, ' ').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    const starts = [...t.matchAll(/"(?:comment|title)"\s*:\s*"/g)].map(m => m.index);
+    const out = [];
+    for (let i = 0; i < starts.length; i++) {
+        const from = Math.max(0, t.lastIndexOf('{', starts[i]));
+        const to = i + 1 < starts.length ? Math.max(from + 1, t.lastIndexOf('{', starts[i + 1])) : t.length;
+        const seg = t.slice(from, to);
+        const str = (names) => {
+            const m = seg.match(new RegExp(`"(?:${names})"\\s*:\\s*"([\\s\\S]*?)"\\s*(?=,\\s*"[A-Za-z_]+"\\s*:|\\})`));
+            return m ? unesc(m[1]) : '';
+        };
+        const km = seg.match(/"(?:key|keys|keywords)"\s*:\s*\[([\s\S]*?)\]/);
+        const key = km ? [...km[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(x => unesc(x[1])) : [];
+        const n = normalizeEntry({ id: str('id'), comment: str('comment|title'), key, content: str('content|summary') });
+        if (n) out.push(n);
+    }
+    return out;
+}
+
+function parseEntries(raw) {
+    const t = String(raw)
+        .replace(/<(think|thinking|reasoning)>[\s\S]*?<\/\1>/gi, '')
+        .replace(/^[\s\S]*<\/(?:think|thinking|reasoning)>/i, '')
+        .trim();
+
+    const texts = [];
+    const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) texts.push(fence[1]);
+    texts.push(t);
+
+    let truncated = false;
+    for (const text of texts) {
+        const r = scanJson(text);
+        if (r.items.length) {
+            r.items.partial = r.truncated;
+            return r.items;
+        }
+        truncated ||= r.truncated;
+    }
+
+    const lenient = lenientEntries(t);
+    if (lenient.length) return lenient;
+
+    const preview = t.replace(/\s+/g, ' ').slice(0, 160);
+    const err = new Error(truncated
+        ? 'A resposta do modelo veio CORTADA antes do JSON terminar (limite de tokens de saída).'
+        : `Resposta do modelo não é um JSON válido.${preview ? ` Início da resposta: "${preview}…"` : ' (a resposta veio vazia depois de remover o raciocínio)'}`);
+    err.truncated = truncated;
+    throw err;
 }
 
 async function askWithRetry(sys, prompt, s, onStatus) {
     let lastErr;
-    for (let attempt = 0; attempt < 2; attempt++) {
-        const p = attempt === 0 ? prompt
-            : prompt + '\n\nIMPORTANT: Your previous reply was NOT valid JSON. Reply with ONLY the raw JSON object, starting with { and ending with }.';
-        if (attempt > 0) onStatus?.('JSON inválido. Pedindo de novo ao modelo…');
+    for (let attempt = 0; attempt < 3; attempt++) {
+        let p = prompt;
+        if (attempt > 0) {
+            if (lastErr?.truncated) {
+                p += '\n\nIMPORTANT: Your previous reply was CUT OFF before the JSON ended (output limit). This time return FEWER and SHORTER entries (in full-lorebook mode at most 4 entries; at most 8 short bullets per entry) and keep any reasoning minimal. Reply with ONLY the raw JSON object.';
+                onStatus?.(`Resposta cortada. Pedindo uma versão mais curta… (tentativa ${attempt + 1}/3)`);
+            } else {
+                p += '\n\nIMPORTANT: Your previous reply was NOT valid JSON. Reply with ONLY the raw JSON object, starting with { and ending with }. Inside strings, escape double quotes as \\" and line breaks as \\n.';
+                onStatus?.(`JSON inválido. Pedindo de novo ao modelo… (tentativa ${attempt + 1}/3)`);
+            }
+        }
         const raw = await callLLM(sys, p, s, onStatus);
-        console.debug(LOG, 'Resposta bruta:', raw);
-        try { return parseEntries(raw); } catch (e) { lastErr = e; }
+        console.log(LOG, `Resposta bruta (tentativa ${attempt + 1}):`, raw);
+        try {
+            const items = parseEntries(raw);
+            if (items.partial) {
+                toastr.warning(`A resposta veio cortada. ${items.length} entrada(s) completas foram aproveitadas; rode de novo para completar o resto.`, 'Lorebook Forge');
+            }
+            return items;
+        } catch (e) {
+            lastErr = e;
+            console.warn(LOG, e.message);
+        }
+    }
+    if (lastErr?.truncated) {
+        lastErr.message += ' Aumente o "Max Response Length" no SillyTavern, reduza "Máx. entradas por bloco" nas configs da extensão, ou use o modo "Entrada única".';
     }
     throw lastErr;
 }
@@ -1162,5 +1259,5 @@ jQuery(async () => {
     c.eventSource.on(ev.CHARACTER_MESSAGE_RENDERED, onMessageForAuto);
 
     registerSlashCommand();
-    console.log(LOG, 'v1.2 carregado.');
+    console.log(LOG, 'v1.3 carregado.');
 });
