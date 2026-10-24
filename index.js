@@ -1,25 +1,28 @@
-// Lorebook Forge — gera/atualiza entradas de World Info a partir do chat,
-// usando a conexão/modelo JÁ configurados no SillyTavern (generateRaw).
+// Lorebook Forge v1.1 — gera/atualiza entradas de World Info a partir do chat,
+// usando a conexão/modelo JÁ configurados no SillyTavern.
 // Nenhuma API key ou LLM embutido.
 
-import * as WI from '../../../world-info.js'; // namespace import: não quebra se algum export mudar
+import * as WI from '../../../world-info.js';
 
 const MODULE = 'lorebook_forge';
 const META_KEY = 'lorebook_forge';
 const LOG = '[Lorebook Forge]';
+const SETTINGS_VERSION = 2;
 
 const defaultSettings = Object.freeze({
-    mode: 'single',            // single | full
-    target: 'chat',            // chat | character | editor | specific | new
+    settingsVersion: SETTINGS_VERSION,
+    mode: 'single',
+    target: 'chat',
     specificBook: '',
     newBookName: '',
-    range: 'new',              // new | all | last
+    range: 'new',
     lastN: 60,
     preview: true,
     updateSingle: true,
     activateNewBook: true,
     chunkChars: 14000,
-    responseLength: 2048,
+    responseLength: 0,          // 0 = usar o limite configurado no próprio ST
+    quietFallback: true,        // plano B: usar o pipeline principal do chat
     maxEntries: 12,
     useSchema: false,
     extraInstructions: '',
@@ -28,13 +31,12 @@ const defaultSettings = Object.freeze({
     autoMode: 'single',
 });
 
-// Propriedades técnicas fixas exigidas
 const LORE_PROPS = Object.freeze({
-    position: 0,            // world_info_position.before  => "Before Char Defs"
-    selectiveLogic: 0,      // world_info_logic.AND_ANY
+    position: 0,            // Before Char Defs
+    selectiveLogic: 0,      // AND ANY
     selective: true,
     excludeRecursion: true, // Non-recursable
-    ignoreBudget: true,     // Ignore budget
+    ignoreBudget: true,
     order: 100,
     constant: false,
     disable: false,
@@ -76,10 +78,16 @@ const ctx = () => SillyTavern.getContext();
 function getSettings() {
     const { extensionSettings } = ctx();
     if (!extensionSettings[MODULE]) extensionSettings[MODULE] = structuredClone(defaultSettings);
+    const s = extensionSettings[MODULE];
     for (const k of Object.keys(defaultSettings)) {
-        if (!Object.hasOwn(extensionSettings[MODULE], k)) extensionSettings[MODULE][k] = defaultSettings[k];
+        if (!Object.hasOwn(s, k)) s[k] = defaultSettings[k];
     }
-    return extensionSettings[MODULE];
+    // Migração v1 -> v2: o limite fixo de 2048 cortava modelos com raciocínio
+    if ((s.settingsVersion ?? 1) < 2) {
+        if (Number(s.responseLength) === 2048) s.responseLength = 0;
+        s.settingsVersion = SETTINGS_VERSION;
+    }
+    return s;
 }
 
 const saveSettings = () => ctx().saveSettingsDebounced();
@@ -130,7 +138,7 @@ function collectLines(range, lastN) {
     const lines = [];
     for (let i = start; i < chat.length; i++) {
         const m = chat[i];
-        if (!m || m.is_system) continue; // ignora mensagens de sistema/ocultas
+        if (!m || m.is_system) continue;
         const text = cleanText(m.mes);
         if (!text) continue;
         const name = m.name || (m.is_user ? c.name1 : c.name2);
@@ -164,7 +172,8 @@ function buildSystemPrompt() {
         'You read roleplay chat logs and distill them into compact, high-signal long-term memory entries that will be injected into future prompts.',
         '',
         'STRICT OUTPUT FORMAT:',
-        '- Reply with ONE valid JSON object and NOTHING else: no markdown, no code fences, no explanations, no thinking out loud.',
+        '- Reply with ONE valid JSON object and NOTHING else: no markdown, no code fences, no explanations.',
+        '- Keep any internal reasoning brief; the final answer must be the JSON object.',
         '- Shape: {"entries":[{"comment":"...","key":["...","...","..."],"content":"- ...\\n- ..."}]}',
         '- Use double quotes. Escape line breaks inside strings as \\n. No trailing commas.',
         '',
@@ -226,20 +235,74 @@ function existingBlock(items, cap) {
     return out;
 }
 
-// ───────────────────────── LLM + Parsing ─────────────────────────
+// ───────────────────────── LLM ─────────────────────────
 
-async function callLLM(systemPrompt, prompt, s) {
+const isEmptyError = (e) => /no message generated/i.test(String(e?.message ?? e ?? ''));
+
+async function callRaw(systemPrompt, prompt, s, responseLength) {
     const c = ctx();
     if (typeof c.generateRaw !== 'function') throw new Error('generateRaw() indisponível nesta versão do SillyTavern.');
     const opts = { systemPrompt, prompt };
-    const rl = Number(s.responseLength);
-    if (rl > 0) opts.responseLength = rl;
+    if (responseLength > 0) opts.responseLength = responseLength;
     if (s.useSchema) opts.jsonSchema = JSON_SCHEMA;
-    const res = await c.generateRaw(opts);
-    return String(res ?? '');
+    const res = String(await c.generateRaw(opts) ?? '');
+    if (!res.trim()) throw new Error('No message generated');
+    return res;
 }
 
-// Escapa quebras de linha literais dentro de strings JSON (erro comum de LLMs)
+async function callQuiet(systemPrompt, prompt, responseLength) {
+    const c = ctx();
+    if (typeof c.generateQuietPrompt !== 'function') throw new Error('No message generated');
+    const opts = {
+        quietPrompt: `${systemPrompt}\n\n${prompt}`,
+        skipWIAN: true,
+        removeReasoning: true,
+    };
+    if (responseLength > 0) opts.responseLength = responseLength;
+    const res = String(await c.generateQuietPrompt(opts) ?? '');
+    if (!res.trim()) throw new Error('No message generated');
+    return res;
+}
+
+async function callLLM(systemPrompt, prompt, s, onStatus) {
+    const base = Math.max(0, Number(s.responseLength) || 0);
+
+    // Orçamentos: o configurado (0 = o do ST) e depois valores maiores,
+    // pois modelos com raciocínio podem gastar tudo "pensando".
+    const budgets = [base];
+    for (const b of [8192, 16384]) if (base === 0 || b > base) budgets.push(b);
+
+    let lastErr;
+    for (let i = 0; i < budgets.length; i++) {
+        try {
+            if (i > 0) onStatus?.(`Resposta vazia. Tentando de novo com mais tokens (${budgets[i]})…`);
+            return await callRaw(systemPrompt, prompt, s, budgets[i]);
+        } catch (e) {
+            lastErr = e;
+            console.warn(LOG, `generateRaw falhou (tokens=${budgets[i] || 'ST'}):`, e);
+            if (!isEmptyError(e)) throw e; // erro real da API: não insistir
+        }
+    }
+
+    if (s.quietFallback) {
+        try {
+            onStatus?.('Tentando pelo pipeline principal do chat (plano B)…');
+            return await callQuiet(systemPrompt, prompt, budgets[budgets.length - 1]);
+        } catch (e) {
+            lastErr = e;
+            console.warn(LOG, 'generateQuietPrompt falhou:', e);
+            if (!isEmptyError(e)) throw e;
+        }
+    }
+
+    if (isEmptyError(lastErr)) {
+        throw new Error('O modelo devolveu resposta vazia mesmo com mais tokens. Aumente "Max Response Length" no ST, reduza o "Reasoning Effort" do modelo, ou diminua "Máx. caracteres por bloco" nas configs da extensão.');
+    }
+    throw lastErr;
+}
+
+// ───────────────────────── Parsing ─────────────────────────
+
 function escapeNewlinesInStrings(src) {
     let out = '', inStr = false, esc = false;
     for (const ch of src) {
@@ -266,7 +329,7 @@ function tryParse(str) {
     ];
     attempts.push(escapeNewlinesInStrings(attempts[1]));
     for (const a of attempts) {
-        try { return JSON.parse(a); } catch { /* próxima tentativa */ }
+        try { return JSON.parse(a); } catch { /* próxima */ }
     }
     return undefined;
 }
@@ -317,12 +380,13 @@ function parseEntries(raw) {
     throw new Error('Resposta do modelo não é um JSON válido.');
 }
 
-async function askWithRetry(sys, prompt, s) {
+async function askWithRetry(sys, prompt, s, onStatus) {
     let lastErr;
     for (let attempt = 0; attempt < 2; attempt++) {
         const p = attempt === 0 ? prompt
             : prompt + '\n\nIMPORTANT: Your previous reply was NOT valid JSON. Reply with ONLY the raw JSON object, starting with { and ending with }.';
-        const raw = await callLLM(sys, p, s);
+        if (attempt > 0) onStatus?.('JSON inválido. Pedindo de novo ao modelo…');
+        const raw = await callLLM(sys, p, s, onStatus);
         console.debug(LOG, 'Resposta bruta:', raw);
         try { return parseEntries(raw); } catch (e) { lastErr = e; }
     }
@@ -395,7 +459,6 @@ function newEntry(book, data) {
         const e = WI.createWorldInfoEntry(book, data);
         if (e) return e;
     }
-    // Fallback manual
     const uid = Object.keys(data.entries).map(Number).filter(Number.isFinite).reduce((a, b) => Math.max(a, b), -1) + 1;
     const e = {
         uid, key: [], keysecondary: [], comment: '', content: '',
@@ -437,7 +500,6 @@ async function forge({ mode, range, lastN, onStatus }) {
     if (!data) throw new Error(`Não foi possível carregar o lorebook "${target.book}".`);
     const bookEntries = Object.values(data.entries ?? {});
 
-    // Lista de trabalho (existentes + novas)
     let working = [];
     const toWork = (e) => ({ uid: e.uid, comment: e.comment || '', key: Array.isArray(e.key) ? [...e.key] : [], content: e.content || '', status: 'existing' });
 
@@ -460,7 +522,7 @@ async function forge({ mode, range, lastN, onStatus }) {
             transcript: chunks[k], part: k + 1, total: chunks.length,
             existing: existingBlock(mode === 'single' ? working.slice(0, 1) : working, cap),
         });
-        const items = await askWithRetry(sys, prompt, s);
+        const items = await askWithRetry(sys, prompt, s, onStatus);
 
         if (mode === 'single') {
             const it = items[0];
@@ -509,7 +571,7 @@ async function commit(result) {
     }
     if (target.isNew) {
         if (s.activateNewBook) activateGlobally(book);
-        s.target = 'specific';   // próximas execuções atualizam este mesmo lorebook
+        s.target = 'specific';
         s.specificBook = book;
         saveSettings();
     }
@@ -656,8 +718,9 @@ async function openModal() {
             }
         } catch (e) {
             console.error(LOG, e);
-            status(`✖ ${e.message}`, 'err');
-            toastr.error(e.message, 'Lorebook Forge');
+            const msg = e?.message || String(e);
+            status(`✖ ${msg}`, 'err');
+            toastr.error(msg, 'Lorebook Forge');
         } finally {
             busy = false;
             await handle?.hide?.();
@@ -687,7 +750,7 @@ async function openModal() {
             refreshVisibility();
         } catch (e) {
             console.error(LOG, e);
-            toastr.error(e.message, 'Lorebook Forge');
+            toastr.error(e?.message || String(e), 'Lorebook Forge');
         } finally {
             busy = false;
         }
@@ -728,8 +791,11 @@ function settingsHtml(s) {
             <small>O modo automático salva sem pré-visualização, no destino escolhido no modal.</small>
             <hr>
             <b>Avançado</b>
+            <label>Tamanho máx. da resposta (tokens) — 0 = usar o do SillyTavern
+                <input type="number" min="0" id="lbf_resp" class="text_pole" value="${Number(s.responseLength)}">
+            </label>
+            <label class="checkbox_label"><input type="checkbox" id="lbf_quiet" ${s.quietFallback ? 'checked' : ''}> Plano B: se vier vazio, tentar pelo pipeline principal do chat</label>
             <label>Máx. caracteres por bloco do chat <input type="number" min="2000" id="lbf_chunk" class="text_pole" value="${Number(s.chunkChars)}"></label>
-            <label>Tamanho máx. da resposta (tokens) <input type="number" min="256" id="lbf_resp" class="text_pole" value="${Number(s.responseLength)}"></label>
             <label>Máx. entradas por bloco (modo completo) <input type="number" min="1" id="lbf_maxent" class="text_pole" value="${Number(s.maxEntries)}"></label>
             <label class="checkbox_label"><input type="checkbox" id="lbf_schema" ${s.useSchema ? 'checked' : ''}> Usar Structured Output / JSON Schema (só Chat Completion compatível)</label>
             <label class="checkbox_label"><input type="checkbox" id="lbf_activate" ${s.activateNewBook ? 'checked' : ''}> Ativar globalmente lorebooks novos</label>
@@ -743,13 +809,18 @@ function settingsHtml(s) {
 }
 
 function bindSettings(s) {
-    const num = (sel, key, def) => $(sel).on('input', function () { s[key] = Number(this.value) || def; saveSettings(); });
+    const num = (sel, key, def) => $(sel).on('input', function () {
+        const v = Number(this.value);
+        s[key] = Number.isFinite(v) && this.value !== '' ? v : def;
+        saveSettings();
+    });
     $('#lbf_open').on('click', openModal);
     $('#lbf_auto').on('change', function () { s.autoEnabled = this.checked; saveSettings(); });
     num('#lbf_auto_every', 'autoEvery', 20);
     $('#lbf_auto_mode').on('change', function () { s.autoMode = this.value; saveSettings(); });
+    num('#lbf_resp', 'responseLength', 0);
+    $('#lbf_quiet').on('change', function () { s.quietFallback = this.checked; saveSettings(); });
     num('#lbf_chunk', 'chunkChars', 14000);
-    num('#lbf_resp', 'responseLength', 2048);
     num('#lbf_maxent', 'maxEntries', 12);
     $('#lbf_schema').on('change', function () { s.useSchema = this.checked; saveSettings(); });
     $('#lbf_activate').on('change', function () { s.activateNewBook = this.checked; saveSettings(); });
@@ -782,7 +853,7 @@ async function onMessageForAuto() {
             toastr.success(`${r.created} nova(s), ${r.updated} atualizada(s)`, `Lorebook "${r.book}"`);
         } catch (e) {
             console.warn(LOG, 'Auto falhou:', e);
-            toastr.warning(e.message, 'Lorebook Forge (auto)');
+            toastr.warning(e?.message || String(e), 'Lorebook Forge (auto)');
         }
     }, 800);
 }
@@ -812,7 +883,7 @@ function registerSlashCommand() {
                     toastr.success(msg, 'Lorebook Forge');
                     return msg;
                 } catch (e) {
-                    toastr.error(e.message, 'Lorebook Forge');
+                    toastr.error(e?.message || String(e), 'Lorebook Forge');
                     return '';
                 }
             },
@@ -826,12 +897,12 @@ function registerSlashCommand() {
 
 jQuery(async () => {
     const s = getSettings();
+    saveSettings(); // grava a migração v2
     const c = ctx();
 
     $('#extensions_settings2').append(settingsHtml(s));
     bindSettings(s);
 
-    // Botão discreto no menu de extensões (varinha mágica)
     const $wand = $(`
         <div id="lbf_wand_btn" class="list-group-item flex-container flexGap5" title="Lorebook Forge">
             <div class="fa-solid fa-book-medical extensionsMenuExtensionButton"></div>
@@ -844,5 +915,5 @@ jQuery(async () => {
     c.eventSource.on(ev.CHARACTER_MESSAGE_RENDERED, onMessageForAuto);
 
     registerSlashCommand();
-    console.log(LOG, 'carregado.');
+    console.log(LOG, 'v1.1 carregado.');
 });
